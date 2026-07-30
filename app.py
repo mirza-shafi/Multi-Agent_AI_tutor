@@ -20,20 +20,7 @@ load_dotenv()
 _sessions: dict[str, object] = {}   # session_id -> TutoringCoordinator
 
 
-# ── Helper: run async in sync context (Gradio is sync by default) ─────────────
-def run_async(coro):
-    """Run an async coroutine from a sync Gradio handler."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+# Gradio 4+ supports async def handlers natively — no run_async wrapper needed.
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -230,7 +217,7 @@ def build_results_html(session) -> str:
 
 # ── Step handlers ─────────────────────────────────────────────────────────────
 
-def step_start(student_name: str, topic: str):
+async def step_start(student_name: str, topic: str):
     """Called when student clicks 'Start Learning'. Validates topic."""
     from agents.coordinator import TutoringCoordinator
 
@@ -255,7 +242,7 @@ def step_start(student_name: str, topic: str):
 
     coordinator = TutoringCoordinator(student_name=student_name.strip(), topic=topic.strip())
 
-    is_valid, welcome = run_async(coordinator.validate_topic())
+    is_valid, welcome = await coordinator.validate_topic()
     if not is_valid:
         return (
             build_agent_status_html("Coordinator"),
@@ -276,7 +263,7 @@ def step_start(student_name: str, topic: str):
     )
 
 
-def step_teach(coordinator, status_box):
+async def step_teach(coordinator, status_box):
     """Runs Explainer and Quiz Master. Returns explanation + quiz."""
     if coordinator is None:
         return (
@@ -297,10 +284,10 @@ def step_teach(coordinator, status_box):
         logs.append(msg)
 
     # Teaching phase
-    session, intro = run_async(coordinator.run_teaching_phase(status_callback=cb))
+    session, intro = await coordinator.run_teaching_phase(status_callback=cb)
 
     # Quiz phase
-    session = run_async(coordinator.run_quiz_phase(status_callback=cb))
+    session = await coordinator.run_quiz_phase(status_callback=cb)
 
     questions = session.quiz_questions
 
@@ -337,7 +324,7 @@ def step_teach(coordinator, status_box):
     )
 
 
-def step_evaluate(coordinator, questions, q1_ans, q2_ans, q3_ans):
+async def step_evaluate(coordinator, questions, q1_ans, q2_ans, q3_ans):
     """Collects answers and runs Evaluator. Also triggers re-teach if needed."""
     if coordinator is None or not questions:
         return (
@@ -362,14 +349,12 @@ def step_evaluate(coordinator, questions, q1_ans, q2_ans, q3_ans):
     logs = []
     def cb(msg): logs.append(msg)
 
-    session = run_async(
-        coordinator.run_evaluation_phase(
-            student_answers=answers,
-            status_callback=cb,
-        )
+    session = await coordinator.run_evaluation_phase(
+        student_answers=answers,
+        status_callback=cb,
     )
 
-    closing = run_async(coordinator.get_closing_message())
+    closing = await coordinator.get_closing_message()
 
     results_html = build_results_html(session)
     log_text = "\n".join(logs)
@@ -392,13 +377,7 @@ def step_evaluate(coordinator, questions, q1_ans, q2_ans, q3_ans):
 
 def create_app():
     with gr.Blocks(
-        css=CUSTOM_CSS,
         title="Leo — Multi-Agent AI Tutor",
-        theme=gr.themes.Base(
-            primary_hue="violet",
-            secondary_hue="orange",
-            neutral_hue="slate",
-        ),
     ) as demo:
 
         # ── Internal state ──
@@ -541,10 +520,16 @@ def create_app():
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = create_app()
+    app.queue()   # Enable queue so long-running agent calls don't freeze the browser
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
         show_error=True,
-        favicon_path=None,
+        css=CUSTOM_CSS,
+        theme=gr.themes.Base(
+            primary_hue="violet",
+            secondary_hue="orange",
+            neutral_hue="slate",
+        ),
     )
