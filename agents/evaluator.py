@@ -1,18 +1,15 @@
 """
-evaluator.py — Leo's Evaluator Agent
+evaluator.py — Leo's Evaluator Agent (Powered by Groq Llama-3.3-70B)
 
 Role: Receives the Quiz Master's questions and the student's answers,
       grades each answer, provides constructive per-question feedback,
       calculates a total score (0–3), and determines if re-teaching is needed.
-
-Handoff trigger: If score <= 1, sets needs_reteach=True and identifies
-                 the questions the student got wrong for the Explainer.
 """
 
 import os
 import json
-from google.antigravity import Agent, LocalAgentConfig
-from google.antigravity.types import TemplatedSystemInstructions
+import asyncio
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from memory.session_store import QuizQuestion, QuestionFeedback, SessionMemory
@@ -43,7 +40,7 @@ async def run_evaluator(
     status_callback=None,
 ) -> SessionMemory:
     """
-    Run the Evaluator agent to grade student answers.
+    Run the Evaluator agent to grade student answers using Groq Llama-3.3-70B.
 
     Args:
         session: The shared SessionMemory with quiz_questions and student_answers.
@@ -55,7 +52,7 @@ async def run_evaluator(
     if status_callback:
         status_callback("✅ Evaluator Agent is grading your answers...")
 
-    # First: grade locally (deterministic — no LLM needed for scoring)
+    # First: grade locally (deterministic — 100% accurate scoring)
     feedback_list: list[QuestionFeedback] = []
     wrong_topics: list[str] = []
     score = 0
@@ -82,12 +79,9 @@ async def run_evaluator(
             feedback=fb_text,
         ))
 
-    # Then: get rich narrative feedback from the LLM
-    config = LocalAgentConfig(
-        system_instructions=TemplatedSystemInstructions(
-            identity=EVALUATOR_IDENTITY
-        ),
-    )
+    # Then: get rich narrative feedback from Groq Llama-3.3-70B
+    api_key = os.getenv("GROQ_API_KEY")
+    client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
     questions_context = session.to_quiz_context()
     answers_context = session.to_answers_context()
@@ -100,17 +94,23 @@ async def run_evaluator(
         f"Please evaluate the student's performance and provide detailed feedback."
     )
 
-    async with Agent(config) as agent:
-        response = await agent.chat(prompt)
-        narrative_feedback = await response.text()
+    response = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": EVALUATOR_IDENTITY},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.5,
+    )
+
+    narrative_feedback = response.choices[0].message.content
 
     # Update session memory
     session.score = score
     session.question_feedback = feedback_list
     session.needs_reteach = score <= 1
-    
-    # Attach narrative to last feedback item for display
-    if feedback_list:
+
+    if feedback_list and narrative_feedback:
         feedback_list[-1].feedback += f"\n\n---\n**Overall Feedback from Evaluator:**\n{narrative_feedback}"
 
     if session.needs_reteach and wrong_topics:

@@ -1,5 +1,5 @@
 """
-explainer.py — Leo's Explainer Agent
+explainer.py — Leo's Explainer Agent (Powered by Groq Llama-3.3-70B)
 
 Role: Teaches a topic clearly using a structured explanation format.
       Can be called twice: once for initial teaching, once for re-teaching
@@ -7,8 +7,8 @@ Role: Teaches a topic clearly using a structured explanation format.
 """
 
 import os
-from google.antigravity import Agent, LocalAgentConfig
-from google.antigravity.types import TemplatedSystemInstructions
+import asyncio
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,12 +36,11 @@ async def run_explainer(
     status_callback=None,
 ) -> str:
     """
-    Run the Explainer agent.
+    Run the Explainer agent using Groq Llama-3.3-70B.
 
     Args:
         topic: The subject to teach (e.g. "Python decorators").
-        reteach_focus: Optional string describing weak areas to focus on
-                       during a re-teach pass.
+        reteach_focus: Optional string describing weak areas to focus on during re-teach.
         status_callback: Optional callable(str) for UI status updates.
 
     Returns:
@@ -50,11 +49,8 @@ async def run_explainer(
     if status_callback:
         status_callback("📚 Explainer Agent is preparing your lesson...")
 
-    config = LocalAgentConfig(
-        system_instructions=TemplatedSystemInstructions(
-            identity=EXPLAINER_IDENTITY
-        ),
-    )
+    api_key = os.getenv("GROQ_API_KEY")
+    client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
     if reteach_focus:
         prompt = (
@@ -66,9 +62,16 @@ async def run_explainer(
     else:
         prompt = f"Please teach me about: **{topic}**"
 
-    async with Agent(config) as agent:
-        response = await agent.chat(prompt)
-        explanation = await response.text()
+    response = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": EXPLAINER_IDENTITY},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.6,
+    )
+
+    explanation = response.choices[0].message.content
 
     if status_callback:
         status_callback("✅ Explainer Agent finished.")

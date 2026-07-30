@@ -15,12 +15,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── State container ───────────────────────────────────────────────────────────
-# We use a global dict to pass state across Gradio steps (stateful session).
-_sessions: dict[str, object] = {}   # session_id -> TutoringCoordinator
-
-
-# Gradio 4+ supports async def handlers natively — no run_async wrapper needed.
+# ── Server-side Session Memory ────────────────────────────────────────────────
+_sessions: dict[str, object] = {}   # "active" -> TutoringCoordinator instance
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -147,7 +143,7 @@ label.svelte-1b6s6un { color: #a0a0cc !important; }
 """
 
 
-# ── Build UI ──────────────────────────────────────────────────────────────────
+# ── Render Helpers ────────────────────────────────────────────────────────────
 
 def build_agent_status_html(active: str) -> str:
     """Renders the agent status pills."""
@@ -171,18 +167,6 @@ def build_agent_status_html(active: str) -> str:
         + "".join(pills)
         + "</div>"
     )
-
-
-def build_quiz_html(questions) -> str:
-    """Renders quiz questions as styled HTML (for display — actual inputs are Gradio)."""
-    html = ""
-    for i, q in enumerate(questions, 1):
-        html += f"""
-        <div class="leo-card" style="margin:12px 0;">
-            <p style="color:#a0a0ff;font-size:0.8rem;margin:0 0 4px;">Question {i}</p>
-            <p style="font-weight:700;margin:0 0 12px;">{q.question}</p>
-        </div>"""
-    return html
 
 
 def build_results_html(session) -> str:
@@ -228,7 +212,6 @@ async def step_start(student_name: str, topic: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            None,
         )
     if not topic.strip():
         return (
@@ -237,10 +220,10 @@ async def step_start(student_name: str, topic: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            None,
         )
 
     coordinator = TutoringCoordinator(student_name=student_name.strip(), topic=topic.strip())
+    _sessions["active"] = coordinator
 
     is_valid, welcome = await coordinator.validate_topic()
     if not is_valid:
@@ -250,7 +233,6 @@ async def step_start(student_name: str, topic: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            None,
         )
 
     return (
@@ -259,26 +241,36 @@ async def step_start(student_name: str, topic: str):
         gr.update(visible=True),   # show "Start Teaching" button
         gr.update(visible=False),
         gr.update(visible=False),
-        coordinator,               # pass coordinator as state
     )
 
 
-async def step_teach(coordinator, status_box):
-    """Runs Explainer and Quiz Master. Returns explanation + quiz."""
+async def step_teach(status_box):
+    """Runs Explainer and Quiz Master. Yields progressive UI updates."""
+    coordinator = _sessions.get("active")
     if coordinator is None:
-        return (
+        yield (
             build_agent_status_html("Explainer"),
             "❌ Session not started. Please go back.",
-            "", [],
+            "",
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
-            coordinator,
         )
+        return
 
-    logs = []
+    logs = ["📚 Explainer Agent is preparing your lesson..."]
+    yield (
+        build_agent_status_html("Explainer"),
+        "\n".join(logs),
+        "",
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
 
     def cb(msg):
         logs.append(msg)
@@ -286,9 +278,19 @@ async def step_teach(coordinator, status_box):
     # Teaching phase
     session, intro = await coordinator.run_teaching_phase(status_callback=cb)
 
+    yield (
+        build_agent_status_html("Quiz Master"),
+        "\n".join(logs),
+        session.explanation,
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
+
     # Quiz phase
     session = await coordinator.run_quiz_phase(status_callback=cb)
-
     questions = session.quiz_questions
 
     # Build radio choices for each question
@@ -308,68 +310,87 @@ async def step_teach(coordinator, status_box):
         else:
             radio_updates.append(gr.update(visible=False))
 
-    log_text = "\n".join(logs)
-
-    return (
+    yield (
         build_agent_status_html("Quiz Master"),
-        log_text,
+        "\n".join(logs),
         session.explanation,
-        session.quiz_questions,
         gr.update(visible=True),     # explanation panel
         radio_updates[0],            # q1
         radio_updates[1],            # q2
         radio_updates[2],            # q3
         gr.update(visible=True),     # submit button
-        coordinator,
     )
 
 
-async def step_evaluate(coordinator, questions, q1_ans, q2_ans, q3_ans):
-    """Collects answers and runs Evaluator. Also triggers re-teach if needed."""
-    if coordinator is None or not questions:
-        return (
+async def step_evaluate(q1_ans, q2_ans, q3_ans):
+    """Collects answers and runs Evaluator. Yields progressive UI updates."""
+    coordinator = _sessions.get("active")
+    if coordinator is None or not getattr(coordinator.session, "quiz_questions", None):
+        yield (
             build_agent_status_html("Evaluator"),
             "❌ No active session.",
             "",
             gr.update(visible=False),
             "",
             gr.update(visible=False),
-            coordinator,
+            "",
         )
+        return
+
+    questions = coordinator.session.quiz_questions
+    logs = ["✅ Evaluator Agent is grading your answers..."]
+    yield (
+        build_agent_status_html("Evaluator"),
+        "\n".join(logs),
+        '<div style="text-align:center;padding:24px;color:#a0a0ff;font-size:1.1rem;">⏳ Evaluator is checking your answers...</div>',
+        gr.update(visible=True),
+        "",
+        gr.update(visible=False),
+        "",
+    )
 
     # Parse answers from "A: option text" → "A"
     raw_answers = [q1_ans, q2_ans, q3_ans]
     answers = []
     for i, raw in enumerate(raw_answers[:len(questions)]):
-        if raw:
+        if raw and isinstance(raw, str) and len(raw) > 0:
             answers.append(raw[0])  # first char is "A"/"B"/"C"/"D"
         else:
             answers.append("A")     # fallback
 
-    logs = []
-    def cb(msg): logs.append(msg)
+    def cb(msg):
+        logs.append(msg)
 
+    # Run evaluation phase
     session = await coordinator.run_evaluation_phase(
         student_answers=answers,
         status_callback=cb,
     )
 
-    closing = await coordinator.get_closing_message()
-
     results_html = build_results_html(session)
-    log_text = "\n".join(logs)
-
     reteach_visible = session.needs_reteach
     reteach_content = session.reteach_explanation if session.needs_reteach else ""
 
-    return (
-        build_agent_status_html("Done"),
-        log_text,
+    yield (
+        build_agent_status_html("Evaluator"),
+        "\n".join(logs),
         results_html,
         gr.update(visible=True),
         reteach_content,
         gr.update(visible=reteach_visible),
-        coordinator,
+        "⏳ Coordinator is summarizing your performance...",
+    )
+
+    closing = await coordinator.get_closing_message()
+
+    yield (
+        build_agent_status_html("Done"),
+        "\n".join(logs),
+        results_html,
+        gr.update(visible=True),
+        reteach_content,
+        gr.update(visible=reteach_visible),
+        f"### 🧭 Coordinator's Closing Message\n\n{closing}",
     )
 
 
@@ -379,10 +400,6 @@ def create_app():
     with gr.Blocks(
         title="Leo — Multi-Agent AI Tutor",
     ) as demo:
-
-        # ── Internal state ──
-        coordinator_state = gr.State(None)
-        questions_state   = gr.State([])
 
         # ── Header ──
         gr.HTML("""
@@ -477,32 +494,29 @@ def create_app():
                 teach_btn,
                 results_group,
                 reteach_group,
-                coordinator_state,
             ],
         )
 
         # Step 2: Teach → explanation + quiz
         teach_btn.click(
             fn=step_teach,
-            inputs=[coordinator_state, agent_log],
+            inputs=[agent_log],
             outputs=[
                 agent_status,
                 agent_log,
                 explanation_box,
-                questions_state,
                 explanation_group,
                 q1,
                 q2,
                 q3,
                 submit_btn,
-                coordinator_state,
             ],
         )
 
         # Step 3: Submit → evaluate + optional re-teach
         submit_btn.click(
             fn=step_evaluate,
-            inputs=[coordinator_state, questions_state, q1, q2, q3],
+            inputs=[q1, q2, q3],
             outputs=[
                 agent_status,
                 agent_log,
@@ -510,7 +524,7 @@ def create_app():
                 results_group,
                 reteach_box,
                 reteach_group,
-                coordinator_state,
+                closing_box,
             ],
         )
 

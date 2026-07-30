@@ -1,5 +1,5 @@
 """
-coordinator.py — Leo's Coordinator Agent
+coordinator.py — Leo's Coordinator Agent (Powered by Groq Llama-3.3-70B)
 
 Role: Master orchestrator of the multi-agent tutoring pipeline.
       - Receives the student's topic request
@@ -7,14 +7,11 @@ Role: Master orchestrator of the multi-agent tutoring pipeline.
       - Delegates to Explainer → Quiz Master → Evaluator (sequential)
       - Triggers re-teaching if Evaluator flags it (feedback loop)
       - Handles errors gracefully
-
-Orchestration Pattern: Sequential / Hierarchical
-  Coordinator controls the flow; each agent is a specialist sub-unit.
 """
 
 import os
-from google.antigravity import Agent, LocalAgentConfig
-from google.antigravity.types import TemplatedSystemInstructions
+import asyncio
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from memory.session_store import SessionMemory
@@ -41,12 +38,6 @@ You speak in a friendly, motivating tone. Always address the student by name.
 class TutoringCoordinator:
     """
     The central orchestrator that manages the full Leo tutoring pipeline.
-    
-    Usage:
-        coordinator = TutoringCoordinator(student_name="Alice", topic="Python decorators")
-        session = await coordinator.run_teaching_phase(status_callback=my_cb)
-        # (student answers quiz)
-        session = await coordinator.run_evaluation_phase(student_answers=["A","B","C"], ...)
     """
 
     def __init__(self, student_name: str, topic: str):
@@ -54,17 +45,17 @@ class TutoringCoordinator:
             student_name=student_name,
             topic=topic,
         )
-        self._coordinator_config = LocalAgentConfig(
-            system_instructions=TemplatedSystemInstructions(
-                identity=COORDINATOR_IDENTITY
-            ),
-        )
+
+    def _get_client(self) -> AsyncOpenAI:
+        api_key = os.getenv("GROQ_API_KEY")
+        return AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
     async def validate_topic(self) -> tuple[bool, str]:
         """
         Use the Coordinator LLM to validate and optionally clarify the topic.
         Returns (is_valid, coordinator_message).
         """
+        client = self._get_client()
         prompt = (
             f"A student named {self.session.student_name} wants to learn about: "
             f"'{self.session.topic}'. "
@@ -72,11 +63,17 @@ class TutoringCoordinator:
             f"welcome message confirming the topic. If no or unclear, explain "
             f"what clarification is needed."
         )
-        async with Agent(self._coordinator_config) as agent:
-            response = await agent.chat(prompt)
-            message = await response.text()
 
-        # Simple heuristic: if the response contains "clarification" assume invalid
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": COORDINATOR_IDENTITY},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+        )
+
+        message = response.choices[0].message.content
         is_valid = "clarification" not in message.lower()
         return is_valid, message
 
@@ -87,19 +84,23 @@ class TutoringCoordinator:
         Phase 1: Coordinator → Explainer.
         Returns updated session and coordinator intro message.
         """
-        # Coordinator introduces the session
-        async with Agent(self._coordinator_config) as agent:
-            intro_response = await agent.chat(
-                f"Introduce the start of a tutoring session for "
-                f"{self.session.student_name} on the topic: '{self.session.topic}'. "
-                f"Be brief and enthusiastic (2-3 sentences)."
-            )
-            intro_msg = await intro_response.text()
+        client = self._get_client()
+        intro_response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": COORDINATOR_IDENTITY},
+                {
+                    "role": "user",
+                    "content": f"Introduce the start of a tutoring session for {self.session.student_name} on '{self.session.topic}'. Be brief and enthusiastic.",
+                },
+            ],
+            temperature=0.6,
+        )
+        intro_msg = intro_response.choices[0].message.content
 
         if status_callback:
             status_callback("🧭 Coordinator: Starting teaching phase...")
 
-        # Hand off to Explainer
         explanation = await run_explainer(
             topic=self.session.topic,
             status_callback=status_callback,
@@ -124,24 +125,6 @@ class TutoringCoordinator:
             status_callback=status_callback,
         )
 
-        if not questions:
-            # Graceful fallback: Coordinator generates a simple question
-            if status_callback:
-                status_callback(
-                    "⚠️ Coordinator: Quiz Master encountered an issue. "
-                    "Using fallback questions..."
-                )
-            from memory.session_store import QuizQuestion
-            questions = [
-                QuizQuestion(
-                    question=f"What is the main purpose of {self.session.topic}?",
-                    options={"A": "Processing data", "B": "Managing memory",
-                             "C": "Core concept of the topic", "D": "Networking"},
-                    correct_answer="C",
-                    explanation="This is a fallback question. Please retry.",
-                )
-            ]
-
         self.session.quiz_questions = questions
         return self.session
 
@@ -151,7 +134,7 @@ class TutoringCoordinator:
         status_callback=None,
     ) -> SessionMemory:
         """
-        Phase 3: Evaluator grades answers. Triggers re-teach if needed (bonus loop).
+        Phase 3: Evaluator grades answers. Triggers re-teaching if needed (bonus loop).
         Returns fully evaluated session.
         """
         if not self.session.quiz_questions:
@@ -186,12 +169,17 @@ class TutoringCoordinator:
 
     async def get_closing_message(self) -> str:
         """Coordinator generates a closing/encouragement message."""
+        client = self._get_client()
         score = self.session.score
-        async with Agent(self._coordinator_config) as agent:
-            response = await agent.chat(
-                f"{self.session.student_name} just completed their Leo tutoring "
-                f"session on '{self.session.topic}' and scored {score}/3. "
-                f"Give them an encouraging closing message (2-3 sentences). "
-                f"If they scored 3/3, celebrate! If lower, motivate them to keep going."
-            )
-            return await response.text()
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": COORDINATOR_IDENTITY},
+                {
+                    "role": "user",
+                    "content": f"{self.session.student_name} just completed their tutoring session on '{self.session.topic}' and scored {score}/3. Give an encouraging closing message.",
+                },
+            ],
+            temperature=0.6,
+        )
+        return response.choices[0].message.content
